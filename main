@@ -1,0 +1,185 @@
+import asyncio
+import logging
+import credentials
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as ec
+import requests as req
+import re
+from bs4 import BeautifulSoup as bs
+import datetime
+from datetime import date
+import time
+import random
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters.command import Command
+from aiogram import F
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from langchain.schema import HumanMessage, SystemMessage
+from langchain.chat_models.gigachat import GigaChat
+
+# Включаем логирование, чтобы не пропустить важные сообщения
+logging.basicConfig(level=logging.INFO)
+# Объект бота
+bot = Bot(token=credentials.token)
+# Диспетчер
+dp = Dispatcher()
+# Скорость парсера
+speed = 1
+
+# Авторизация в сервисе GigaChat - он будет выводить краткое описание новостей
+chat = GigaChat(
+    credentials=credentials.gigachat,
+    verify_ssl_certs=False
+)
+messages = [
+    SystemMessage(
+        content='Ты бот, нейтрально и максимально кратко описывающий новости.'
+    )
+]
+
+# Создаем драйвер
+chrome_options = Options()
+chrome_options.add_argument("user-data-dir=C:\\profile")  # сохраняем настройки профиля, чтобы работал AdBlock
+driver = webdriver.Chrome(options=chrome_options)  # с AdBlock парсер будет функционировать быстрее и стабильнее
+
+
+def news():
+    """Основная функция, которая находит новость и возвращает её название и ссылку"""
+
+    def click_button():
+        """Функция для нажатия на кнопку пагинатора внизу страницы"""
+        while True:
+            try:
+                wait = WebDriverWait(driver, 1)  # ждём до 1 секунды, чтобы появилась кнопка
+                button = wait.until(
+                    ec.element_to_be_clickable((By.XPATH, '//*[@class = "archive-articles-list__button"]')))
+                button.click()
+            except:
+                break
+
+    def random_date():
+        """Функция для определения случайной даты, начиная с начала 2000 года"""
+        global result_date
+        start_date = datetime.date(2000, 1, 1)
+        end_date = date.today()
+        num_days = (end_date - start_date).days
+        rand_days = random.randint(1, num_days)
+        random_date = start_date + datetime.timedelta(days=rand_days)
+        result_date = str(random_date).replace('-', '/')
+
+    global speed
+    all_news = []
+    while len(all_news) == 0:
+        try:
+            random_date()
+            driver.get("https://www.vedomosti.ru/archive/" + result_date)
+
+            if speed == 0:
+                try:
+                    click_button()
+                except:
+                    pass
+
+            time.sleep(0.2)  # ожидание, чтобы страница полностью прогрузилась
+            html = driver.page_source
+            soup = bs(html, 'html.parser')
+            all_news = soup.findAll(attrs={'class': re.compile("^article-preview-item archive-articles-list__item$")})
+        except Exception as e:
+            logging.error(f"Error while fetching news: {e}")
+            continue
+
+    news_links = {}
+
+    for news in all_news:
+        news_links[news.find('h2').text] = news['href']
+
+    title, link = random.choice(list(news_links.items()))
+    link = 'https://www.vedomosti.ru' + link
+
+    return title, link
+
+
+def get_news_text(url):
+    """Функция для извлечения текста новости"""
+    response = req.get(url)
+    soup = bs(response.text, 'html.parser')
+    news_text = soup.find('div', {'class': 'article-boxes-list article__boxes'}).text
+    return news_text
+# Хэндлер на команду /start
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    kb = [
+        [types.KeyboardButton(text="Выведи новость")],
+        [types.KeyboardButton(text="Параметры")]
+    ]
+    keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    await message.answer("Привет! Я выбираю и вывожу случайные новости, написанные с 2000 года по наши дни.",
+                         reply_markup=keyboard)
+
+
+# Хэндлер на сообщение "Параметры"
+@dp.message(F.text.lower() == "параметры")
+async def settings(message: types.Message):
+    kb = [
+        [types.KeyboardButton(text="Медленный режим (парсит все доступные новости)")],
+        [types.KeyboardButton(text="Быстрый режим (не используется пагинатор)")]
+    ]
+    keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    await message.answer("Выберите настройки работы парсера.", reply_markup=keyboard)
+
+
+# Хэндлер на сообщение "Медленный режим (парсит все доступные новости)"
+@dp.message(F.text.lower() == "медленный режим (парсит все доступные новости)")
+async def slow_mode(message: types.Message):
+    global speed
+    speed = 0
+    await cmd_start(message)
+
+
+# Хэндлер на сообщение "Быстрый режим (не используется пагинатор)"
+@dp.message(F.text.lower() == "быстрый режим (не используется пагинатор)")
+async def fast_mode(message: types.Message):
+    global speed
+    speed = 1
+    await cmd_start(message)
+
+
+# Хэндлер на сообщение "Выведи новость"
+@dp.message(F.text.lower() == "выведи новость")
+@dp.throttled(anti_flood, rate=5)
+async def writing_title(message: types.Message):
+    global link
+    title, link = news()
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        types.InlineKeyboardButton(text="Источник", url=link),
+        types.InlineKeyboardButton(text="О чём новость", callback_data='news_text')
+    )
+    await message.answer(
+        f"{result_date}: {title}",
+        reply_markup=builder.as_markup()
+    )
+
+
+# Хэндлер на нажатие инлайн-кнопки "О чём новость"
+@dp.callback_query(lambda c: c.data == 'news_text')
+async def process_callback_button(callback_query: types.CallbackQuery):
+    global link
+    news_text = get_news_text(link)
+    messages.append(HumanMessage(content=news_text))
+    res = chat(messages)
+    messages.append(res)
+    await bot.send_message(callback_query.from_user.id, res.content)
+
+
+# Запуск процесса поллинга новых апдейтов
+async def main():
+    await dp.start_polling(bot)
+
+
+# Main
+if name == "main":
+    asyncio.run(main())
